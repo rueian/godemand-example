@@ -1,0 +1,171 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: godemand
+  labels:
+    name: godemand
+data:
+  godemand.yaml: |
+    plugins:
+      pgplugin:
+        path: /pgplugin
+    pools:
+      pg10:
+        plugin: pgplugin
+        params:
+          ConfigPath: /etc/postgresql/10/main/postgresql.conf
+          HbaPath: /etc/postgresql/10/main/pg_hba.conf
+          RecoveryConfigPath: /var/lib/postgresql/10/main/recovery.conf
+          SnapshotPrefix: pg10
+      pg11:
+        plugin: pgplugin
+        params:
+          ConfigPath: /etc/postgresql/11/main/postgresql.conf
+          HbaPath: /etc/postgresql/11/main/pg_hba.conf
+          RecoveryConfigPath: /var/lib/postgresql/11/main/recovery.conf
+          SnapshotPrefix: pg11
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: godemand
+  labels:
+    name: godemand
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: godemand
+  template:
+    metadata:
+      labels:
+        name: godemand
+    spec:
+      containers:
+        - name: godemand
+          image: rueian/godemand-example
+          command: ["/godemand"]
+          env:
+            - name: CONFIG_PATH
+              value: /config/godemand.yaml
+            - name: REDIS_ARRD
+              value: redis:6379
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          resources:
+            requests:
+              cpu: "0.05"
+      volumes:
+        - name: config
+          configMap:
+            name: godemand
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgproxy
+  labels:
+    name: pgproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: pgproxy
+  template:
+    metadata:
+      labels:
+        name: pgproxy
+    spec:
+      containers:
+        - name: pgproxy
+          image: rueian/godemand-example
+          command: ["/pgproxy"]
+          env:
+            - name: GODEMAND_ADDR
+              value: http://godemand
+          ports:
+            - containerPort: 5432
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 3
+          resources:
+            requests:
+              cpu: "0.05"
+
+---
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: redis
+  labels:
+    name: redis
+spec:
+  serviceName: "redis"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        name: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:5-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "0.05"
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: redis
+spec:
+  selector:
+    name: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: godemand
+spec:
+  selector:
+    name: godemand
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: pgproxy
+
+spec:
+  selector:
+    name: pgproxy
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+  sessionAffinity: ClientIP
+  type: LoadBalancer

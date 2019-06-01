@@ -1,0 +1,19 @@
+version: '3.4'
+
+services:
+  build:
+    image: golang:1.12
+    working_dir: /src
+    volumes:
+      - ./.dockerbuild/gopath:/go
+      - ./.dockerbuild/build:/build
+      - .:/src
+    environment:
+      - SSH_PRIVATE_KEY
+    command: ["bash", "-c", "
+      ls /src/cmd | xargs -I {} go build -o /build/{} /src/cmd/{}/main.go
+    "]
+  image:
+    image: rueian/godemand-example
+    build:
+      context: .
