@@ -1,0 +1,8 @@
+[Unit]
+Description=loadavg
+
+[Service]
+ExecStart=/loadavg
+
+[Install]
+WantedBy=multi-user.target

@@ -418,5 +418,5 @@ do
   sleep 1
 done
 
-nc -l 8743 > /dev/null 2>&1
+service loadavg start
 `))
