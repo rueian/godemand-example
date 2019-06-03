@@ -371,10 +371,11 @@ total_mem=$(expr $(cat /proc/meminfo | grep MemTotal | awk '{print $2}') )
 hugepage_size=$(expr $(cat /proc/meminfo | grep Hugepagesize | awk '{print $2}') )
 
 shared_buffers=$(expr $total_mem \/ 4)
+hugepages_mem=$(expr $total_mem \/ 3)
 effective_cache_size=$(expr $total_mem \* 3 \/ 4)
 maintenance_work_mem=$(expr $total_mem \/ 16)
 work_mem=$(expr $total_mem \/ 4 \/ 100)
-nr_hugepages=$(expr $shared_buffers \/ 10 \* 11 \/ $hugepage_size)
+nr_hugepages=$(expr $hugepages_mem \/ $hugepage_size + 1)
 
 echo $nr_hugepages > /proc/sys/vm/nr_hugepages
 echo "never" > /sys/kernel/mm/transparent_hugepage/enabled
