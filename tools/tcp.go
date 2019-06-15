@@ -2,7 +2,10 @@ package tools
 
 import (
 	"errors"
+	"io/ioutil"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -45,4 +48,37 @@ func Poke(instance *compute.Instance, port string, times int) (bool, error) {
 		err = errors.New("no network ip")
 	}
 	return false, err
+}
+
+func GetLoad(addr string) (float64, float64, float64, error) {
+	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer conn.Close()
+
+	output, err := ioutil.ReadAll(conn)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	loading := strings.Split(string(output), " ")
+	if len(loading) < 3 {
+		return 0, 0, 0, errors.New("malformed loadavg")
+	}
+
+	m1, err := strconv.ParseFloat(loading[0], 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	m5, err := strconv.ParseFloat(loading[1], 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	m15, err := strconv.ParseFloat(loading[2], 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	return m1, m5, m15, nil
 }

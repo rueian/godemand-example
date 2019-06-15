@@ -27,7 +27,8 @@ func CallParam(params map[string]interface{}) pgplugin.CallParam {
 	projectID, _ := metadata.ProjectID()
 
 	return pgplugin.CallParam{
-		MaxClients:        tools.GetInt(params, "MaxClients", 50),
+		MaxLoads:          tools.GetInt(params, "MaxLoads", 10),
+		MaxServSecond:     tools.GetInt(params, "MaxServSecond", 10800),
 		MaxLifeSecond:     tools.GetInt(params, "MaxLifeSecond", 1800),
 		MaxIdleSecond:     tools.GetInt(params, "MaxIdleSecond", 300),
 		MaxSyncWindow:     tools.GetInt(params, "MaxSyncWindow", 30),
@@ -40,6 +41,9 @@ func CallParam(params map[string]interface{}) pgplugin.CallParam {
 }
 
 func main() {
+	// remove timestamp from plugin logging because godemand will log it.
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+
 	ctx := context.Background()
 
 	cred, err := google.FindDefaultCredentials(ctx, compute.ComputeScope)
@@ -56,6 +60,7 @@ func main() {
 		Service:          tools.NewComputeService(service),
 		StartupFactory:   StartParam,
 		CallParamFactory: CallParam,
+		LatestSnapshots:  make(map[string]pgplugin.SnapshotCache),
 	}
 
 	if err := plugin.Serve(ctx, controller); err != nil {

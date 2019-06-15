@@ -49,7 +49,7 @@ func (r *GodemandResolver) GetPGConn(ctx context.Context, clientAddr net.Addr, p
 			return nil, err
 		}
 		wrapConn := WrapConn(conn.(*net.TCPConn), res, c)
-		go wrapConn.Heartbeating()
+		go wrapConn.Heartbeat()
 
 		return wrapConn, nil
 	}
@@ -73,8 +73,10 @@ type Conn struct {
 	resource types.Resource
 	client   *client.HTTPClient
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx         context.Context
+	cancel      context.CancelFunc
+	heartbeat   bool
+	heartbeatAt time.Time
 }
 
 func (c *Conn) Close() error {
@@ -82,14 +84,31 @@ func (c *Conn) Close() error {
 	return c.TCPConn.Close()
 }
 
-func (c *Conn) Heartbeating() {
+func (c *Conn) Heartbeat() {
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
 		}
-		c.client.Heartbeat(c.ctx, c.resource)
+		if c.heartbeat {
+			c.heartbeatAt = time.Now()
+			c.client.Heartbeat(c.ctx, c.resource)
+		}
 		time.Sleep(10 * time.Second)
 	}
+}
+
+func (c *Conn) StartHeartbeat() {
+	c.heartbeat = true
+}
+
+func (c *Conn) StopHeartbeat() {
+	c.heartbeat = false
+	go func() {
+		if time.Since(c.heartbeatAt) > 10*time.Second {
+			c.heartbeatAt = time.Now()
+			c.client.Heartbeat(c.ctx, c.resource)
+		}
+	}()
 }

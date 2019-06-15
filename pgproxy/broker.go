@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 
 	"github.com/rueian/pgbroker/backend"
 	"github.com/rueian/pgbroker/message"
@@ -15,9 +16,31 @@ func NewPGBroker(resolver backend.PGResolver) *proxy.Server {
 	serverMessageHandlers := proxy.NewServerMessageHandlers()
 
 	clientMessageHandlers.AddHandleQuery(func(ctx *proxy.Ctx, msg *message.Query) (query *message.Query, e error) {
+		if c, ok := ctx.ServerConn.(*Conn); ok {
+			c.StartHeartbeat()
+		}
+
 		user := ctx.ConnInfo.StartupParameters["user"]
 		database := ctx.ConnInfo.StartupParameters["database"]
-		log.Printf("Query: db=%s user=%s query=%s\n", database, user, msg.QueryString)
+		log.Printf("Query: db=%s user=%s query=%s\n", database, user, strings.ReplaceAll(msg.QueryString, "\n", " "))
+		return msg, nil
+	})
+
+	clientMessageHandlers.AddHandleParse(func(ctx *proxy.Ctx, msg *message.Parse) (parse *message.Parse, e error) {
+		if c, ok := ctx.ServerConn.(*Conn); ok {
+			c.StartHeartbeat()
+		}
+
+		user := ctx.ConnInfo.StartupParameters["user"]
+		database := ctx.ConnInfo.StartupParameters["database"]
+		log.Printf("Query: db=%s user=%s query=%s\n", database, user, strings.ReplaceAll(msg.QueryString, "\n", " "))
+		return msg, nil
+	})
+
+	serverMessageHandlers.AddHandleReadyForQuery(func(ctx *proxy.Ctx, msg *message.ReadyForQuery) (query *message.ReadyForQuery, e error) {
+		if c, ok := ctx.ServerConn.(*Conn); ok {
+			c.StopHeartbeat()
+		}
 		return msg, nil
 	})
 

@@ -15,8 +15,9 @@ import (
 )
 
 type CallParam struct {
-	MaxClients        int
+	MaxLoads          int
 	MaxLifeSecond     int
+	MaxServSecond     int
 	MaxIdleSecond     int
 	MaxSyncWindow     int
 	SnapshotPrefix    string
@@ -26,10 +27,16 @@ type CallParam struct {
 	InstanceMachine   string
 }
 
+type SnapshotCache struct {
+	Snapshot string
+	FoundAt  time.Time
+}
+
 type Controller struct {
 	Service          *tools.ComputeService
 	StartupFactory   func(params map[string]interface{}, snapshot string) StartupParam
 	CallParamFactory func(params map[string]interface{}) CallParam
+	LatestSnapshots  map[string]SnapshotCache
 }
 
 var StateOrder = map[types.ResourceState]int{
@@ -67,10 +74,27 @@ func (c *Controller) FindResource(pool types.ResourcePool, params map[string]int
 	})
 
 	for _, res := range resources {
-		now := time.Now()
+		if time.Since(res.CreatedAt) > time.Duration(cp.MaxLifeSecond)*time.Second {
+			k := cp.SnapshotProjectID + cp.SnapshotPrefix
+			if c.LatestSnapshots[k].FoundAt.Before(res.CreatedAt) {
+				snapshot, err := c.Service.FindLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
+				if err == nil {
+					c.LatestSnapshots[k] = SnapshotCache{
+						Snapshot: snapshot.SelfLink,
+						FoundAt:  time.Now(),
+					}
+				}
+			}
+			if snapshot, ok := res.Meta["snapshot"].(string); ok && snapshot < c.LatestSnapshots[k].Snapshot {
+				continue
+			}
+		}
 
-		if res.CreatedAt.Add(time.Duration(cp.MaxLifeSecond) * time.Second).Before(now.Add(-10 * time.Minute)) {
-			continue
+		if loadAddr, ok := res.Meta["load"].(string); ok && res.State == types.ResourceServing {
+			m1, m5, m15, err := tools.GetLoad(loadAddr)
+			if err == nil && m1 > m5 && m1 > m15 && m1 > float64(cp.MaxLoads) {
+				continue
+			}
 		}
 
 		if res.State == types.ResourceTerminated || res.State == types.ResourceTerminating {
@@ -110,6 +134,10 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			if err != nil {
 				log.Printf("fail to find latest snapshot of prefix %q: %s\n", cp.SnapshotPrefix, err.Error())
 				return types.Resource{}, err
+			}
+			c.LatestSnapshots[cp.SnapshotProjectID+cp.SnapshotPrefix] = SnapshotCache{
+				Snapshot: snapshot.SelfLink,
+				FoundAt:  time.Now(),
 			}
 
 			if snapshot == nil {
@@ -155,6 +183,9 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 		}
 
 		log.Printf("instance %q created\n", resource.ID)
+		resource.Meta = types.Meta{
+			"snapshot": d.SourceSnapshot,
+		}
 		resource.State = types.ResourceBooting
 	case types.ResourceBooting:
 		// check service running
@@ -170,7 +201,9 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			if success, err := tools.Poke(instance, "8743", 5); success {
 				resource.State = types.ResourceServing
 				resource.Meta = types.Meta{
-					"addr": instance.NetworkInterfaces[0].NetworkIP + ":5432",
+					"addr":     instance.NetworkInterfaces[0].NetworkIP + ":5432",
+					"load":     instance.NetworkInterfaces[0].NetworkIP + ":8743",
+					"snapshot": resource.Meta["snapshot"],
 				}
 			} else if err != nil {
 				log.Printf("fail to poke instance %q on startup port, try again later: %s\n", resource.ID, err.Error())
@@ -222,7 +255,7 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			break
 		}
 		ts := resource.LastClientHeartbeat
-		if ts.IsZero() {
+		if ts.Before(resource.StateChange) {
 			ts = resource.StateChange
 		}
 		if ts.Add(time.Duration(cp.MaxIdleSecond) * time.Second).Before(time.Now()) {
@@ -230,8 +263,8 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			resource.State = types.ResourceTerminating
 			break
 		}
-		if resource.CreatedAt.Add(2 * time.Duration(cp.MaxLifeSecond) * time.Second).Before(time.Now()) {
-			log.Printf("instance %q exceeds 2x MaxLifeSecond %d, mark deleting\n", resource.ID, 2*cp.MaxLifeSecond)
+		if resource.CreatedAt.Add(time.Duration(cp.MaxServSecond) * time.Second).Before(time.Now()) {
+			log.Printf("instance %q exceeds MaxServSecond %d, mark deleting\n", resource.ID, cp.MaxServSecond)
 			resource.State = types.ResourceDeleting
 			break
 		}
@@ -268,9 +301,21 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			break
 		}
 		if resource.CreatedAt.Add(time.Duration(cp.MaxLifeSecond) * time.Second).Before(time.Now()) {
-			log.Printf("instance %q exceeds MaxLifeSecond %d, mark deleting\n", resource.ID, cp.MaxLifeSecond)
-			resource.State = types.ResourceDeleting
-			break
+			k := cp.SnapshotProjectID + cp.SnapshotPrefix
+			if c.LatestSnapshots[k].FoundAt.Before(resource.CreatedAt) {
+				snapshot, err := c.Service.FindLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
+				if err == nil {
+					c.LatestSnapshots[k] = SnapshotCache{
+						Snapshot: snapshot.SelfLink,
+						FoundAt:  time.Now(),
+					}
+				}
+			}
+			if snapshot, ok := resource.Meta["snapshot"].(string); ok && snapshot < c.LatestSnapshots[k].Snapshot {
+				log.Printf("instance %q exceeds MaxLifeSecond %d, mark deleting\n", resource.ID, cp.MaxLifeSecond)
+				resource.State = types.ResourceDeleting
+				break
+			}
 		}
 
 		if instance.Status == "RUNNING" {
@@ -369,6 +414,8 @@ var startup = template.Must(template.New("startup").Parse(`#!/bin/bash -e
 
 total_mem=$(expr $(cat /proc/meminfo | grep MemTotal | awk '{print $2}') )
 hugepage_size=$(expr $(cat /proc/meminfo | grep Hugepagesize | awk '{print $2}') )
+cpu_count=$(cat /proc/cpuinfo | grep processor | wc -l)
+max_workers=$(expr $cpu_count \* 2 + 2)
 
 shared_buffers=$(expr $total_mem \/ 4)
 hugepages_mem=$(expr $total_mem \/ 3)
@@ -387,6 +434,11 @@ sed -i "s/^shared_buffers = .*/shared_buffers = $(expr $shared_buffers \/ 1024)M
 sed -i "s/^effective_cache_size = .*/effective_cache_size = $(expr $effective_cache_size \/ 1024)MB/g" {{ .ConfigPath }}
 sed -i "s/^maintenance_work_mem = .*/maintenance_work_mem = $(expr $maintenance_work_mem \/ 1024)MB/g" {{ .ConfigPath }}
 sed -i "s/^work_mem = .*/work_mem = $(echo $work_mem)kB/g" {{ .ConfigPath }}
+
+sed -i "s/^max_worker_processes = .*/max_worker_processes = $(echo $max_workers)/g" {{ .ConfigPath }}
+sed -i "s/^max_parallel_workers_per_gather = .*/max_parallel_workers_per_gather = $(echo $cpu_count)/g" {{ .ConfigPath }}
+
+echo "random_page_cost = 6" >> {{ .ConfigPath }}
 
 grep -Fxq "host all all 10.0.0.0/8 md5" {{ .HbaPath }} || echo "host all all 10.0.0.0/8 md5" >> {{ .HbaPath }}
 grep -Fxq "host all all 172.16.0.0/12 md5" {{ .HbaPath }} || echo "host all all 172.16.0.0/12 md5" >> {{ .HbaPath }}

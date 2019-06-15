@@ -37,7 +37,7 @@ func main() {
 	defer sd.Flush()
 
 	go func() {
-		err := metrics.StartRecording(time.Minute, sd)
+		err := metrics.StartRecording(2*time.Minute, sd)
 		if err != nil {
 			log.Fatalf("Failed StartRecording: %v", err)
 		}
@@ -45,7 +45,6 @@ func main() {
 
 	pool := redis.NewResourcePool(client)
 	locker := redis.NewLocker(client)
-
 	launchpad := plugin.NewLaunchpad()
 	defer launchpad.Close()
 
