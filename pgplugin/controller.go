@@ -6,6 +6,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -28,15 +29,16 @@ type CallParam struct {
 }
 
 type SnapshotCache struct {
-	Snapshot string
+	Snapshot *compute.Snapshot
 	FoundAt  time.Time
+	mu       sync.Mutex
 }
 
 type Controller struct {
 	Service          *tools.ComputeService
 	StartupFactory   func(params map[string]interface{}, snapshot string) StartupParam
 	CallParamFactory func(params map[string]interface{}) CallParam
-	LatestSnapshots  map[string]SnapshotCache
+	LatestSnapshots  sync.Map
 }
 
 var StateOrder = map[types.ResourceState]int{
@@ -49,6 +51,34 @@ var StateOrder = map[types.ResourceState]int{
 	types.ResourceDeleted:     99,
 	types.ResourceUnknown:     99,
 	types.ResourceError:       99,
+}
+
+func (c *Controller) GetLatestSnapshot(snapshotProjectID, snapshotPrefix string) (*compute.Snapshot, error) {
+	k := snapshotProjectID + snapshotPrefix
+
+	cache, _ := c.LatestSnapshots.LoadOrStore(k, &SnapshotCache{})
+	if cache, ok := cache.(*SnapshotCache); ok {
+		if time.Since(cache.FoundAt) < 3*time.Minute {
+			return cache.Snapshot, nil
+		}
+
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+
+		if time.Since(cache.FoundAt) < 3*time.Minute {
+			return cache.Snapshot, nil
+		}
+
+		snapshot, err := c.Service.FindLatestSnapshot(snapshotProjectID, snapshotPrefix)
+		if err != nil {
+			return nil, err
+		}
+		cache.Snapshot = snapshot
+		cache.FoundAt = time.Now()
+
+		return cache.Snapshot, nil
+	}
+	return nil, nil
 }
 
 func (c *Controller) FindResource(pool types.ResourcePool, params map[string]interface{}) (types.Resource, error) {
@@ -65,9 +95,9 @@ func (c *Controller) FindResource(pool types.ResourcePool, params map[string]int
 	sort.Slice(resources, func(i, j int) bool {
 		if resources[i].State == resources[j].State {
 			if resources[i].State == types.ResourceServing {
-				return resources[i].StateChange.After(resources[j].StateChange)
+				return resources[i].CreatedAt.After(resources[j].CreatedAt)
 			} else {
-				return resources[i].StateChange.Before(resources[j].StateChange)
+				return resources[i].CreatedAt.Before(resources[j].CreatedAt)
 			}
 		}
 		return StateOrder[resources[i].State] < StateOrder[resources[j].State]
@@ -75,17 +105,8 @@ func (c *Controller) FindResource(pool types.ResourcePool, params map[string]int
 
 	for _, res := range resources {
 		if time.Since(res.CreatedAt) > time.Duration(cp.MaxLifeSecond)*time.Second {
-			k := cp.SnapshotProjectID + cp.SnapshotPrefix
-			if c.LatestSnapshots[k].FoundAt.Before(res.CreatedAt) {
-				snapshot, err := c.Service.FindLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
-				if err == nil {
-					c.LatestSnapshots[k] = SnapshotCache{
-						Snapshot: snapshot.SelfLink,
-						FoundAt:  time.Now(),
-					}
-				}
-			}
-			if snapshot, ok := res.Meta["snapshot"].(string); ok && snapshot < c.LatestSnapshots[k].Snapshot {
+			snapshot, _ := c.GetLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
+			if link, ok := res.Meta["snapshot"].(string); ok && snapshot != nil && link != snapshot.SelfLink {
 				continue
 			}
 		}
@@ -130,16 +151,11 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 		var d *compute.Disk
 		d, err = c.Service.FindDisk(cp.InstanceProjectID, cp.InstanceZone, resource.ID)
 		if tools.IsStatusNotFound(err) {
-			snapshot, err := c.Service.FindLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
+			snapshot, err := c.GetLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
 			if err != nil {
 				log.Printf("fail to find latest snapshot of prefix %q: %s\n", cp.SnapshotPrefix, err.Error())
 				return types.Resource{}, err
 			}
-			c.LatestSnapshots[cp.SnapshotProjectID+cp.SnapshotPrefix] = SnapshotCache{
-				Snapshot: snapshot.SelfLink,
-				FoundAt:  time.Now(),
-			}
-
 			if snapshot == nil {
 				log.Printf("no snapshot found of prefix %q, mark deleted\n", cp.SnapshotPrefix)
 				resource.State = types.ResourceDeleted
@@ -214,12 +230,12 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			}
 		}
 
-		if resource.StateChange.Add(2 * time.Duration(cp.MaxIdleSecond) * time.Second).Before(time.Now()) {
+		if time.Since(resource.StateChange) > 2*time.Duration(cp.MaxIdleSecond)*time.Second {
 			log.Printf("instance %q createing exceeds 2x MaxIdleSecond %d, mark deleting\n", resource.ID, 2*cp.MaxIdleSecond)
 			resource.State = types.ResourceDeleting
 		}
 	case types.ResourceServing:
-		if resource.LastSynced.Add(time.Duration(cp.MaxSyncWindow) * time.Second).After(time.Now()) {
+		if time.Since(resource.LastSynced) < time.Duration(cp.MaxSyncWindow)*time.Second {
 			return resource, nil
 		}
 		// check service running
@@ -254,20 +270,24 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			resource.State = types.ResourceDeleting
 			break
 		}
-		ts := resource.LastClientHeartbeat
-		if ts.Before(resource.StateChange) {
-			ts = resource.StateChange
-		}
-		if ts.Add(time.Duration(cp.MaxIdleSecond) * time.Second).Before(time.Now()) {
-			log.Printf("instance %q exceeds MaxIdleSecond %d, mark terminating\n", resource.ID, cp.MaxIdleSecond)
-			resource.State = types.ResourceTerminating
-			break
-		}
-		if resource.CreatedAt.Add(time.Duration(cp.MaxServSecond) * time.Second).Before(time.Now()) {
+
+		if time.Since(resource.CreatedAt) > time.Duration(cp.MaxServSecond)*time.Second {
 			log.Printf("instance %q exceeds MaxServSecond %d, mark deleting\n", resource.ID, cp.MaxServSecond)
 			resource.State = types.ResourceDeleting
 			break
 		}
+
+		ts := resource.LastClientHeartbeat
+		if ts.Before(resource.StateChange) {
+			ts = resource.StateChange
+		}
+
+		if time.Since(ts) > time.Duration(cp.MaxIdleSecond)*time.Second {
+			log.Printf("instance %q exceeds MaxIdleSecond %d, mark terminating\n", resource.ID, cp.MaxIdleSecond)
+			resource.State = types.ResourceTerminating
+			break
+		}
+
 		if _, err := tools.Poke(instance, "5432", 5); err != nil {
 			log.Printf("fail to poke instance %q, mark terminating: %s\n", resource.ID, err.Error())
 			resource.State = types.ResourceTerminating
@@ -290,7 +310,7 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			resource.State = types.ResourceTerminated
 		}
 	case types.ResourceTerminated:
-		if resource.LastSynced.Add(time.Duration(cp.MaxSyncWindow) * time.Second).After(time.Now()) {
+		if time.Since(resource.LastSynced) < time.Duration(cp.MaxSyncWindow)*time.Second {
 			return resource, nil
 		}
 
@@ -300,18 +320,10 @@ func (c *Controller) SyncResource(resource types.Resource, params map[string]int
 			resource.State = types.ResourceDeleted
 			break
 		}
-		if resource.CreatedAt.Add(time.Duration(cp.MaxLifeSecond) * time.Second).Before(time.Now()) {
-			k := cp.SnapshotProjectID + cp.SnapshotPrefix
-			if c.LatestSnapshots[k].FoundAt.Before(resource.CreatedAt) {
-				snapshot, err := c.Service.FindLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
-				if err == nil {
-					c.LatestSnapshots[k] = SnapshotCache{
-						Snapshot: snapshot.SelfLink,
-						FoundAt:  time.Now(),
-					}
-				}
-			}
-			if snapshot, ok := resource.Meta["snapshot"].(string); ok && snapshot < c.LatestSnapshots[k].Snapshot {
+
+		if time.Since(resource.CreatedAt) > time.Duration(cp.MaxLifeSecond)*time.Second {
+			snapshot, _ := c.GetLatestSnapshot(cp.SnapshotProjectID, cp.SnapshotPrefix)
+			if link, ok := resource.Meta["snapshot"].(string); ok && snapshot != nil && link != snapshot.SelfLink {
 				log.Printf("instance %q exceeds MaxLifeSecond %d, mark deleting\n", resource.ID, cp.MaxLifeSecond)
 				resource.State = types.ResourceDeleting
 				break

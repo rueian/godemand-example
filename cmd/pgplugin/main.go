@@ -60,7 +60,6 @@ func main() {
 		Service:          tools.NewComputeService(service),
 		StartupFactory:   StartParam,
 		CallParamFactory: CallParam,
-		LatestSnapshots:  make(map[string]pgplugin.SnapshotCache),
 	}
 
 	if err := plugin.Serve(ctx, controller); err != nil {
